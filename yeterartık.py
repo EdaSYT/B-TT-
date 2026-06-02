@@ -2,6 +2,70 @@ import streamlit as st
 import pandas as pd
 from ortools.sat.python import cp_model
 
+# =========================
+# SAYFA AYARI
+# =========================
+st.set_page_config(
+    page_title="Montaj Hattı Dengeleme",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# =========================
+# CSS TASARIM
+# =========================
+st.markdown("""
+<style>
+[data-testid="stSidebar"] {
+    background-color: #eef1f6;
+}
+
+[data-testid="stSidebar"] h1,
+[data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3 {
+    color: #202336;
+}
+
+.main-title {
+    font-size: 48px;
+    font-weight: 800;
+    color: #2d3040;
+    margin-top: 90px;
+}
+
+.subtitle {
+    font-size: 18px;
+    color: #1f2937;
+    margin-top: 10px;
+    margin-bottom: 30px;
+}
+
+.stButton > button {
+    border-radius: 8px;
+    padding: 12px 22px;
+    font-weight: 600;
+    border: 1px solid #d1d5db;
+    background-color: white;
+}
+
+.stButton > button:hover {
+    border-color: #ff4b4b;
+    color: #ff4b4b;
+}
+
+div[data-testid="stMetricValue"] {
+    font-size: 28px;
+}
+
+.block-container {
+    padding-top: 2rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# VERİ
+# =========================
 I = range(1, 64)
 J = range(1, 37)
 W = range(1, 37)
@@ -22,20 +86,45 @@ t_raw = {
 
 SCALE = 100
 t = {i: int(round(t_raw[i] * SCALE)) for i in t_raw}
-
 P = [(i, i + 1) for i in range(1, 63)]
 
-d = {j: {k: 2 * abs(j - k) for k in J} for j in J}
+# =========================
+# SIDEBAR
+# =========================
+st.sidebar.markdown("## ⚙️ Ayarlar")
 
-L = 4
-D = 32
-T = 510
-U_MAX = 0.95
+with st.sidebar.expander("🏗️ Hat Parametreleri", expanded=True):
+    L = st.number_input("Maksimum Yürüme Mesafesi (L)", 1, 20, 4)
+    D = st.number_input("Hedef Üretim Miktarı (D)", 1, 100, 32)
+    T = st.number_input("Vardiya Süresi (T - dk)", 1, 1000, 510)
+
+with st.sidebar.expander("⚖️ Optimizasyon Kısıtları", expanded=True):
+    U_MAX = st.slider("Maks. Operatör Doluluğu (U_MAX)", 0.50, 1.00, 1.00, 0.01)
+
+st.sidebar.markdown("---")
+
+epsilon_choice = st.sidebar.slider(
+    "Detaylı Rapor İçin Operatör Seç",
+    min_value=1,
+    max_value=36,
+    value=29
+)
+
+time_limit = st.sidebar.slider(
+    "Senaryo Başına Süre Limiti (sn)",
+    min_value=5,
+    max_value=120,
+    value=30
+)
+
+d = {j: {k: 2 * abs(j - k) for k in J} for j in J}
 BIG_M = sum(t.values())
 
-
+# =========================
+# MODEL
+# =========================
 @st.cache_data(show_spinner=False)
-def solve_model(exact_workers=None, time_limit=30):
+def solve_model(exact_workers, time_limit, L, D, T, U_MAX):
     model = cp_model.CpModel()
 
     x = {(i, j): model.NewBoolVar(f"x_{i}_{j}") for i in I for j in J}
@@ -51,11 +140,7 @@ def solve_model(exact_workers=None, time_limit=30):
         model.Add(sum(x[i, j] for j in J) == 1)
 
     for i, h in P:
-        model.Add(
-            sum(j * x[i, j] for j in J)
-            <=
-            sum(j * x[h, j] for j in J)
-        )
+        model.Add(sum(j * x[i, j] for j in J) <= sum(j * x[h, j] for j in J))
 
     for j in J:
         model.Add(l[j] == sum(t[i] * x[i, j] for i in I))
@@ -65,7 +150,6 @@ def solve_model(exact_workers=None, time_limit=30):
     for w in W:
         for j in J:
             model.Add(y[w, j] <= z[w])
-
             model.Add(q[w, j] <= l[j])
             model.Add(q[w, j] <= BIG_M * y[w, j])
             model.Add(q[w, j] >= l[j] - BIG_M * (1 - y[w, j]))
@@ -76,11 +160,10 @@ def solve_model(exact_workers=None, time_limit=30):
     for w in W:
         for j in J:
             for k in J:
-                if j < k and d[j][k] > L:
+                if j < k and 2 * abs(j - k) > L:
                     model.Add(y[w, j] + y[w, k] <= 1)
 
-    if exact_workers is not None:
-        model.Add(sum(z[w] for w in W) == exact_workers)
+    model.Add(sum(z[w] for w in W) == exact_workers)
 
     model.Minimize(C)
 
@@ -95,244 +178,170 @@ def solve_model(exact_workers=None, time_limit=30):
 
     C_value = solver.Value(C) / SCALE
 
-    solution = {
+    res = {
         "C": C_value,
         "used_workers": sum(solver.Value(z[w]) for w in W),
-        "stations_of_worker": {w: [] for w in W},
         "ops_of_station": {j: [] for j in J},
         "station_loads": {j: solver.Value(l[j]) / SCALE for j in J},
-        "worker_load_per_product": {
-            w: sum(solver.Value(q[w, j]) for j in J) / SCALE for w in W
-        },
-        "worker_load_per_shift": {
-            w: D * sum(solver.Value(q[w, j]) for j in J) / SCALE for w in W
-        },
-        "worker_U": {
-            w: 100 * ((D / T) * (sum(solver.Value(q[w, j]) for j in J) / SCALE))
-            for w in W
-        },
-        "reachable_output": T / C_value if C_value > 0 else float("inf"),
-        "meets_target": (T / C_value >= D - 1e-6) if C_value > 0 else True,
+        "stations_of_worker": {w: [] for w in W},
+        "worker_load_per_product": {},
+        "worker_load_per_shift": {},
+        "worker_U": {},
+        "reachable_output": T / C_value,
+        "meets_target": T / C_value >= D
     }
 
     for i in I:
         for j in J:
             if solver.Value(x[i, j]) == 1:
-                solution["ops_of_station"][j].append(i)
+                res["ops_of_station"][j].append(i)
 
     for w in W:
+        total = sum(solver.Value(q[w, j]) for j in J) / SCALE
+        res["worker_load_per_product"][w] = total
+        res["worker_load_per_shift"][w] = D * total
+        res["worker_U"][w] = 100 * ((D / T) * total)
+
         for j in J:
             if solver.Value(y[w, j]) == 1:
-                solution["stations_of_worker"][w].append(j)
+                res["stations_of_worker"][w].append(j)
 
-    return solution
+    return res
 
-
-def build_summary_df(results):
-    rows = []
-    feasible_eps = [e for e, res in results.items() if res is not None]
-
-    ideal = None
-    nadir = None
-
-    if feasible_eps:
-        ideal = (
-            min(results[e]["C"] for e in feasible_eps),
-            min(results[e]["used_workers"] for e in feasible_eps)
-        )
-
-        nadir = (
-            max(results[e]["C"] for e in feasible_eps),
-            max(results[e]["used_workers"] for e in feasible_eps)
-        )
-
-    for eps in sorted(results.keys()):
-        res = results[eps]
-
-        if res is None:
-            rows.append({
-                "Epsilon": f"{eps:.2f}",
-                "F1 (C)": "Infeasible",
-                "F2 (Z)": "-",
-                "Ulaşılabilir Üretim": "-",
-                "Hedef?": "-"
-            })
-        else:
-            rows.append({
-                "Epsilon": f"{eps:.2f}",
-                "F1 (C)": f"{res['C']:.2f}",
-                "F2 (Z)": f"{res['used_workers']:.2f}",
-                "Ulaşılabilir Üretim": f"{res['reachable_output']:.2f}",
-                "Hedef?": "Evet" if res["meets_target"] else "Hayır"
-            })
-
-    return ideal, nadir, pd.DataFrame(rows)
-
-
-def build_text_report(results, epsilon_choice):
-    if epsilon_choice not in results or results[epsilon_choice] is None:
-        return f"Epsilon = {epsilon_choice} için uygun çözüm bulunamadı."
-
-    res = results[epsilon_choice]
-
-    lines = []
-
-    lines.append("=" * 78)
-    lines.append(f"DETAYLI SENARYO RAPORU | Operatör Sayısı = {epsilon_choice}")
-    lines.append("=" * 78)
-
-    lines.append(f"Çevrim Süresi (C)                       : {res['C']:.2f} dk/ürün")
-    lines.append(f"Kullanılan Operatör Sayısı              : {res['used_workers']}")
-    lines.append(f"Maksimum İzin Verilen Operatör Doluluğu : %{U_MAX * 100:.2f}")
-    lines.append(f"Ulaşılabilir Üretim                     : {res['reachable_output']:.2f} adet/vardiya")
-    lines.append(f"Hedef Üretim ({D} adet) Sağlanıyor mu?  : {'Evet' if res['meets_target'] else 'Hayır'}")
-
-    lines.append("\n[1] Operasyon -> İstasyon Atamaları")
-    for j in J:
-        lines.append(f"İstasyon {j}: {res['ops_of_station'][j]}")
-
-    lines.append("\n[2] İstasyon Yükleri")
-    for j in J:
-        lines.append(f"İstasyon {j}: {res['station_loads'][j]:.2f} dk")
-
-    lines.append("\n[3] Operatör -> İstasyon Atamaları")
-    for w in W:
-        if len(res["stations_of_worker"][w]) > 0:
-            lines.append(f"Operatör {w}: {res['stations_of_worker'][w]}")
-
-    lines.append("\n[4] Operatör Toplam Yükleri ve U Değerleri")
-    for w in W:
-        if len(res["stations_of_worker"][w]) > 0:
-            lines.append(
-                f"Operatör {w}: "
-                f"ürün başı yük = {res['worker_load_per_product'][w]:.2f} dk, "
-                f"vardiya yükü = {res['worker_load_per_shift'][w]:.2f} dk, "
-                f"U = %{res['worker_U'][w]:.2f}"
-            )
-
-    lines.append("\n[5] Mesafe Kontrolü")
-
-    any_pair = False
-
-    for w in W:
-        sts = res["stations_of_worker"][w]
-
-        if len(sts) >= 2:
-            for a in range(len(sts)):
-                for b in range(a + 1, len(sts)):
-                    j = sts[a]
-                    k = sts[b]
-
-                    any_pair = True
-                    status = "Uygun" if d[j][k] <= L else "İhlal"
-
-                    lines.append(
-                        f"Operatör {w}: "
-                        f"İstasyon {j}-{k}, "
-                        f"mesafe = {d[j][k]}, "
-                        f"durum = {status}"
-                    )
-
-    if not any_pair:
-        lines.append("Birden fazla istasyona atanmış operatör yok.")
-
-    lines.append("=" * 78)
-
-    return "\n".join(lines)
-
-
-st.set_page_config(
-    page_title="Hat Dengeleme CP-SAT",
-    layout="wide"
+# =========================
+# ARAYÜZ
+# =========================
+st.markdown(
+    '<div class="main-title">🏭 Montaj Hattı Dengeleme & Operatör Atama Sistemi</div>',
+    unsafe_allow_html=True
 )
 
-st.title("Hat Dengeleme CP-SAT Optimizasyon Arayüzü")
+st.markdown(
+    '<div class="subtitle">Google OR-Tools CP-SAT Solver tabanlı gelişmiş optimizasyon arayüzü.</div>',
+    unsafe_allow_html=True
+)
 
-with st.sidebar:
-    st.header("Parametreler")
+run = st.button("🚀 Tüm Senaryoları Hesapla ve Analiz Et")
 
-    min_eps = st.number_input(
-        "Başlangıç operatör sayısı",
-        min_value=1,
-        max_value=36,
-        value=1,
-        step=1
-    )
-
-    max_eps = st.number_input(
-        "Bitiş operatör sayısı",
-        min_value=1,
-        max_value=36,
-        value=36,
-        step=1
-    )
-
-    time_limit = st.number_input(
-        "Her senaryo için süre limiti (sn)",
-        min_value=1,
-        max_value=300,
-        value=30,
-        step=1
-    )
-
-    epsilon_choice = st.number_input(
-        "Detaylı rapor operatör sayısı",
-        min_value=1,
-        max_value=36,
-        value=29,
-        step=1
-    )
-
-    run_button = st.button("Modeli Çalıştır", type="primary")
-
-if min_eps > max_eps:
-    st.error("Başlangıç operatör sayısı, bitiş operatör sayısından büyük olamaz.")
-    st.stop()
-
-if run_button:
+if run:
     results = {}
 
     progress = st.progress(0)
-    status_box = st.empty()
+    info = st.empty()
 
-    eps_values = list(range(int(min_eps), int(max_eps) + 1))
+    for eps in range(1, 37):
+        info.info(f"{eps} operatörlü senaryo çözülüyor...")
+        results[eps] = solve_model(eps, time_limit, L, D, T, U_MAX)
+        progress.progress(eps / 36)
 
-    for idx, eps in enumerate(eps_values, start=1):
-        status_box.info(f"{eps} operatörlü senaryo çözülüyor...")
+    info.success("Tüm senaryolar tamamlandı.")
 
-        results[eps] = solve_model(
-            exact_workers=eps,
-            time_limit=int(time_limit)
-        )
+    feasible = [e for e, r in results.items() if r is not None]
 
-        progress.progress(idx / len(eps_values))
+    if feasible:
+        ideal_C = min(results[e]["C"] for e in feasible)
+        ideal_Z = min(results[e]["used_workers"] for e in feasible)
+        nadir_C = max(results[e]["C"] for e in feasible)
+        nadir_Z = max(results[e]["used_workers"] for e in feasible)
 
-    status_box.success("Çözüm tamamlandı.")
+        c1, c2, c3, c4 = st.columns(4)
 
-    ideal, nadir, summary_df = build_summary_df(results)
+        c1.metric("İdeal Nokta", f"({ideal_C:.2f}, {ideal_Z:.2f})")
+        c2.metric("Nadir Nokta", f"({nadir_C:.2f}, {nadir_Z:.2f})")
+        c3.metric("En İyi Üretim", f"{max(results[e]['reachable_output'] for e in feasible):.2f}")
+        c4.metric("Hedef", f"{D} adet")
 
-    if ideal is not None:
-        col1, col2 = st.columns(2)
+    rows = []
 
-        col1.metric(
-            "Ideal Nokta",
-            f"({ideal[0]:.2f}, {ideal[1]:.2f})"
-        )
+    for eps in range(1, 37):
+        r = results[eps]
 
-        col2.metric(
-            "Nadir Nokta",
-            f"({nadir[0]:.2f}, {nadir[1]:.2f})"
-        )
+        if r is None:
+            rows.append([eps, "Infeasible", "-", "-", "-"])
+        else:
+            rows.append([
+                f"{eps:.2f}",
+                f"{r['C']:.2f}",
+                f"{r['used_workers']:.2f}",
+                f"{r['reachable_output']:.2f}",
+                "Evet" if r["meets_target"] else "Hayır"
+            ])
+
+    st.subheader("📊 Epsilon Senaryo Tablosu")
+
+    df = pd.DataFrame(
+        rows,
+        columns=["Epsilon", "F1 (C)", "F2 (Z)", "Ulaşılabilir Üretim", "Hedef?"]
+    )
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.subheader("📋 Detaylı Senaryo Raporu")
+
+    selected = results.get(epsilon_choice)
+
+    if selected is None:
+        st.warning(f"{epsilon_choice} operatör için uygun çözüm bulunamadı.")
     else:
-        st.warning("Hiçbir epsilon değeri için çözüm bulunamadı.")
+        report = []
 
-    st.subheader("Epsilon Senaryo Tablosu")
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        report.append("=" * 78)
+        report.append(f"DETAYLI SENARYO RAPORU | Operatör Sayısı = {epsilon_choice}")
+        report.append("=" * 78)
 
-    st.subheader("Detaylı Senaryo Raporu")
-    report = build_text_report(results, int(epsilon_choice))
+        report.append(f"Çevrim Süresi (C)                       : {selected['C']:.2f} dk/ürün")
+        report.append(f"Kullanılan Operatör Sayısı              : {selected['used_workers']}")
+        report.append(f"Maksimum İzin Verilen Operatör Doluluğu : %{U_MAX * 100:.2f}")
+        report.append(f"Ulaşılabilir Üretim                     : {selected['reachable_output']:.2f} adet/vardiya")
+        report.append(f"Hedef Üretim ({D} adet) Sağlanıyor mu?  : {'Evet' if selected['meets_target'] else 'Hayır'}")
 
-    st.code(report, language="text")
+        report.append("\n[1] Operasyon -> İstasyon Atamaları")
+        for j in J:
+            report.append(f"İstasyon {j}: {selected['ops_of_station'][j]}")
+
+        report.append("\n[2] İstasyon Yükleri")
+        for j in J:
+            report.append(f"İstasyon {j}: {selected['station_loads'][j]:.2f} dk")
+
+        report.append("\n[3] Operatör -> İstasyon Atamaları")
+        for w in W:
+            if selected["stations_of_worker"][w]:
+                report.append(f"Operatör {w}: {selected['stations_of_worker'][w]}")
+
+        report.append("\n[4] Operatör Toplam Yükleri ve U Değerleri")
+        for w in W:
+            if selected["stations_of_worker"][w]:
+                report.append(
+                    f"Operatör {w}: ürün başı yük = "
+                    f"{selected['worker_load_per_product'][w]:.2f} dk, "
+                    f"vardiya yükü = {selected['worker_load_per_shift'][w]:.2f} dk, "
+                    f"U = %{selected['worker_U'][w]:.2f}"
+                )
+
+        report.append("\n[5] Mesafe Kontrolü")
+        any_pair = False
+
+        for w in W:
+            sts = selected["stations_of_worker"][w]
+            if len(sts) >= 2:
+                for a in range(len(sts)):
+                    for b in range(a + 1, len(sts)):
+                        j = sts[a]
+                        k = sts[b]
+                        mesafe = 2 * abs(j - k)
+                        durum = "Uygun" if mesafe <= L else "İhlal"
+                        any_pair = True
+                        report.append(
+                            f"Operatör {w}: İstasyon {j}-{k}, "
+                            f"mesafe = {mesafe}, durum = {durum}"
+                        )
+
+        if not any_pair:
+            report.append("Birden fazla istasyona atanmış operatör yok.")
+
+        report.append("=" * 78)
+
+        st.code("\n".join(report), language="text")
 
 else:
-    st.info("Sol menüden parametreleri seçip 'Modeli Çalıştır' butonuna bas.")
+    st.empty()
